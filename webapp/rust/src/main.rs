@@ -453,6 +453,22 @@ async fn retrieve_player(
         .fetch_optional(tenant_db)
         .await
 }
+// 参加者をまとめて取得する
+async fn retrieve_players(
+    tenant_db: &mut SqliteConnection,
+    ids: Vec<&str>,
+) -> sqlx::Result<Vec<PlayerRow>> {
+    let query_str = format!(
+        "SELECT * FROM player WHERE id IN ( {} );",
+        vec!["?"; ids.len()].join(",")
+    );
+    let mut query = sqlx::query_as(&query_str);
+    for id in ids.iter() {
+        query = query.bind(*id)
+    }
+
+    query.fetch_all(tenant_db).await
+}
 
 // 参加者を認可する
 // 参加者向けAPIで呼ばれる
@@ -893,34 +909,41 @@ async fn players_add_handler(
     let display_names = form_param
         .into_inner()
         .into_iter()
-        .filter_map(|(key, val)| (key == "display_name[]").then(|| val));
+        .filter_map(|(key, val)| (key == "display_name[]").then(|| val))
+        .collect::<Vec<_>>();
 
-    let mut pds = Vec::new();
+    let mut ids = Vec::with_capacity(display_names.len());
+    let query_str = format!(
+        "INSERT INTO player (id, tenant_id, display_name, is_disqualified, created_at, updated_at) VALUES {}",
+        vec!["(?, ?, ?, ?, ?, ?)"; ids.len()].join(",")
+    );
+    let mut query = sqlx::query(&query_str);
+
     for display_name in display_names {
         let id = dispense_id();
-
+        ids.push(id.clone());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        sqlx::query("INSERT INTO player (id, tenant_id, display_name, is_disqualified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(&id)
+
+        query = query
+            .bind(id.clone())
             .bind(v.tenant_id)
             .bind(display_name)
             .bind(false)
             .bind(now)
-            .bind(now)
-            .execute(&mut tenant_db)
-            .await?;
-        let p = retrieve_player(&mut tenant_db, &id).await?;
-        if p.is_none() {
-            return Err(Error::Internal("error retrieve_player".into()));
-        }
-        let p = p.unwrap();
+            .bind(now);
+    }
+    query.execute(&mut tenant_db).await?;
+    let player_rows = retrieve_players(&mut tenant_db, ids.iter().map(|s| &**s).collect()).await?;
+
+    let mut pds = Vec::new();
+    for player in player_rows {
         pds.push(PlayerDetail {
-            id: p.id,
-            display_name: p.display_name,
-            is_disqualified: p.is_disqualified,
+            id: player.id,
+            display_name: player.display_name,
+            is_disqualified: player.is_disqualified,
         });
     }
 
