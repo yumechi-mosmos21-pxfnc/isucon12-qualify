@@ -23,7 +23,7 @@ import { authorizePlayer } from "./authorize_player";
 import { flockByTenantID } from "./flock_by_tenant_id";
 
 //----------------------------------------------------------------------
-import "./api_player_competition_competition_id_ranking";
+import "api_player_competition_competition_id_ranking";
 //----------------------------------------------------------------------
 
 const exec = util.promisify(childProcess.exec)
