@@ -1,1 +1,11 @@
-sqlite-trace.log
+# すべてのファイルを除外し、すべてのフォルダを許可
+*
+!*/
+
+
+# ホワイトリスト
+!.gitignore
+!.gitattributes
+!public/**
+!webapp/**
+!initial_data/**
