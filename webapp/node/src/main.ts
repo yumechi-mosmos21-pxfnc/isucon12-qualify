@@ -1,33 +1,197 @@
-import { Request, Response, NextFunction } from 'express'
+import { Request, Response, NextFunction, RequestHandler } from 'express'
 import multer from 'multer'
 import { RowDataPacket, OkPacket } from 'mysql2/promise'
 import childProcess from 'child_process'
+import { readFile } from 'fs/promises'
+import jwt from 'jsonwebtoken'
 import util from 'util'
+import path from 'path'
 import { Database } from 'sqlite'
+import { openSync, closeSync } from 'fs'
+import fsExt from 'fs-ext'
 import { parse } from 'csv-parse/sync'
 
 import { app } from "./app";
-import { initializeScript, RoleAdmin, RoleOrganizer, RolePlayer, RoleNone, tenantNameRegexp } from "./constants";
+import { initializeScript, cookieName, RoleAdmin, RoleOrganizer, RolePlayer, RoleNone, tenantNameRegexp } from "./constants";
 import { getEnv } from "./get_env";
 import { adminDB } from "./admin_db";
 import { connectToTenantDB, createTenantDB } from "./tenant_db";
 import { dispenseID } from "./dispense_id";
 import { ErrorWithStatus } from "./error_with_status";
-import { TenantWithBilling, TenantDetail, BillingReport, PlayerDetail, CompetitionDetail, PlayerScoreDetail, Viewer, TenantsAddResult, InitializeResult, PlayersListResult, PlayersAddResult, PlayerDisqualifiedResult, CompetitionsAddResult, ScoreResult, BillingResult, PlayerResult, MeResult, CompetitionsResult, TenantRow, CompetitionRow, VisitHistorySummaryRow, PlayerRow, PlayerScoreRow } from "./types";
-import { wrap } from "./wrap";
-import { parseViewer } from "./parse_viewer";
-import { retrieveTenantRowFromHeader } from "./retriwve_tenant_row_from_header";
-import { retrievePlayer } from "./retrive_player";
-import { retrieveCompetition } from "./retrieve_competition";
-import { authorizePlayer } from "./authorize_player";
-import { flockByTenantID } from "./flock_by_tenant_id";
-
-//----------------------------------------------------------------------
-import "api_player_competition_competition_id_ranking";
-//----------------------------------------------------------------------
+import { TenantWithBilling, TenantDetail, BillingReport, PlayerDetail, CompetitionDetail, PlayerScoreDetail, CompetitionRank, WithRowNum, Viewer, TenantsAddResult, InitializeResult, PlayersListResult, PlayersAddResult, PlayerDisqualifiedResult, CompetitionsAddResult, ScoreResult, BillingResult, CompetitionRankingResult, PlayerResult, MeResult, CompetitionsResult, TenantRow, CompetitionRow, VisitHistorySummaryRow, PlayerRow, PlayerScoreRow } from "./types";
 
 const exec = util.promisify(childProcess.exec)
+const flock = util.promisify(fsExt.flock)
 const upload = multer()
+
+// see: https://expressjs.com/en/advanced/best-practice-performance.html#handle-exceptions-properly
+const wrap =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<Response | void>): RequestHandler =>
+  (req, res, next) =>
+    fn(req, res, next).catch(next)
+
+// リクエストヘッダをパースしてViewerを返す
+async function parseViewer(req: Request): Promise<Viewer> {
+  const tokenStr = req.cookies[cookieName]
+  if (!tokenStr) {
+    throw new ErrorWithStatus(401, `cookie ${cookieName} is not found`)
+  }
+
+  const keyFilename = getEnv('ISUCON_JWT_KEY_FILE', '../public.pem')
+  const cert = await readFile(keyFilename)
+
+  let token: jwt.JwtPayload
+  try {
+    token = jwt.verify(tokenStr, cert, {
+      algorithms: ['RS256'],
+    }) as jwt.JwtPayload
+  } catch (error) {
+    throw new ErrorWithStatus(401, `${error}`)
+  }
+
+  if (!token.sub) {
+    throw new ErrorWithStatus(401, `invalid token: subject is not found in token: ${tokenStr}`)
+  }
+  const subject = token.sub
+
+  const tr: string | undefined = token['role']
+  if (!tr) {
+    throw new ErrorWithStatus(401, `invalid token: role is not found: ${tokenStr}`)
+  }
+
+  let role = ''
+  switch (tr) {
+    case RoleAdmin:
+    case RoleOrganizer:
+    case RolePlayer:
+      role = tr
+      break
+
+    default:
+      throw new ErrorWithStatus(401, `invalid token: invalid role: ${tokenStr}"`)
+  }
+
+  // aud は1要素で、テナント名が入っている
+  const aud: string[] | undefined = token.aud as string[]
+  if (!aud || aud.length !== 1) {
+    throw new ErrorWithStatus(401, `invalid token: aud field is few or too much: ${tokenStr}`)
+  }
+
+  const tenant = await retrieveTenantRowFromHeader(req)
+  if (!tenant) {
+    throw new ErrorWithStatus(401, 'tenant not found')
+  }
+  if (tenant.name === 'admin' && role !== RoleAdmin) {
+    throw new ErrorWithStatus(401, 'tenant not found')
+  }
+  if (tenant.name !== aud[0]) {
+    throw new ErrorWithStatus(401, `invalid token: tenant name is not match with ${req.hostname}: ${tokenStr}`)
+  }
+
+  return {
+    role: role,
+    playerId: subject,
+    tenantName: tenant.name,
+    tenantId: tenant.id ?? 0,
+  }
+}
+
+async function retrieveTenantRowFromHeader(req: Request): Promise<TenantRow | undefined> {
+  // JWTに入っているテナント名とHostヘッダのテナント名が一致しているか確認
+  const baseHost = getEnv('ISUCON_BASE_HOSTNAME', '.t.isucon.dev')
+  const tenantName = req.hostname.replace(baseHost, '')
+
+  // SaaS管理者用ドメイン
+  if (tenantName === 'admin') {
+    return {
+      id: 0,
+      name: 'admin',
+      display_name: 'admin',
+    }
+  }
+
+  // テナントの存在確認
+  try {
+    const [[tenantRow]] = await adminDB.query<(TenantRow & RowDataPacket)[]>('SELECT * FROM tenant WHERE name = ?', [
+      tenantName,
+    ])
+    return tenantRow
+  } catch (error) {
+    throw new Error(`failed to Select tenant: name=${tenantName}, ${error}`)
+  }
+}
+
+// 参加者を取得する
+async function retrievePlayer(tenantDB: Database, id: string): Promise<PlayerRow | undefined> {
+  try {
+    const playerRow = await tenantDB.get<PlayerRow>('SELECT * FROM player WHERE id = ?', id)
+    return playerRow
+  } catch (error) {
+    throw new Error(`error Select player: id=${id}, ${error}`)
+  }
+}
+
+// 参加者を認可する
+// 参加者向けAPIで呼ばれる
+async function authorizePlayer(tenantDB: Database, id: string): Promise<Error | undefined> {
+  try {
+    const player = await retrievePlayer(tenantDB, id)
+    if (!player) {
+      throw new ErrorWithStatus(401, 'player not found')
+    }
+    if (player.is_disqualified) {
+      throw new ErrorWithStatus(403, 'player is disqualified')
+    }
+    return
+  } catch (error) {
+    return error as Error
+  }
+}
+
+// 大会を取得する
+async function retrieveCompetition(tenantDB: Database, id: string): Promise<CompetitionRow | undefined> {
+  try {
+    const competitionRow = await tenantDB.get<CompetitionRow>('SELECT * FROM competition WHERE id = ?', id)
+    return competitionRow
+  } catch (error) {
+    throw new Error(`error Select competition: id=${id}, ${error}`)
+  }
+}
+
+// 排他ロックのためのファイル名を生成する
+function lockFilePath(tenantId: number): string {
+  const tenantDBDir = getEnv('ISUCON_TENANT_DB_DIR', '../tenant_db')
+  return path.join(tenantDBDir, `${tenantId}.lock`)
+}
+
+async function asyncSleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+// 排他ロックする
+async function flockByTenantID(tenantId: number): Promise<() => Promise<void>> {
+  const p = lockFilePath(tenantId)
+
+  const fd = openSync(p, 'w+')
+  for (;;) {
+    try {
+      await flock(fd, fsExt.constants.LOCK_EX | fsExt.constants.LOCK_NB)
+    } catch (error: any) {
+      if (error.code === 'EAGAIN' && error.errno === 11) {
+        await asyncSleep(10)
+        continue
+      }
+      throw new Error(`error flock: path=${p}, ${error}`)
+    }
+    break
+  }
+
+  const close = async () => {
+    await flock(fd, fsExt.constants.LOCK_UN)
+    closeSync(fd)
+  }
+  return close
+}
 
 // SaaS管理者向けAPI
 // テナントを追加する
@@ -880,6 +1044,130 @@ app.get(
   })
 )
 
+// 参加者向けAPI
+// GET /api/player/competition/:competitionId/ranking
+// 大会ごとのランキングを取得する
+app.get(
+  '/api/player/competition/:competitionId/ranking',
+  wrap(async (req: Request, res: Response) => {
+    try {
+      const viewer = await parseViewer(req)
+      if (viewer.role !== RolePlayer) {
+        throw new ErrorWithStatus(403, 'role player required')
+      }
+
+      const { competitionId } = req.params
+      if (!competitionId) {
+        throw new ErrorWithStatus(400, 'competition_id is required')
+      }
+
+      let cd: CompetitionDetail
+      const ranks: CompetitionRank[] = []
+      const tenantDB = await connectToTenantDB(viewer.tenantId)
+      try {
+        const error = await authorizePlayer(tenantDB, viewer.playerId)
+        if (error) {
+          throw error
+        }
+
+        const competition = await retrieveCompetition(tenantDB, competitionId)
+        if (!competition) {
+          throw new ErrorWithStatus(404, 'competition not found')
+        }
+        cd = {
+          id: competition.id,
+          title: competition.title,
+          is_finished: !!competition.finished_at,
+        }
+
+        const now = Math.floor(new Date().getTime() / 1000)
+        const [[tenant]] = await adminDB.query<(TenantRow & RowDataPacket)[]>('SELECT * FROM tenant WHERE id = ?', [
+          viewer.tenantId,
+        ])
+
+        await adminDB.execute<OkPacket>(
+          'INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+          [viewer.playerId, tenant.id, competitionId, now, now]
+        )
+
+        const { rank_after: rankAfterStr } = req.query
+        let rankAfter: number
+        if (rankAfterStr) {
+          rankAfter = parseInt(rankAfterStr.toString(), 10)
+        }
+
+        // player_scoreを読んでいるときに更新が走ると不整合が起こるのでロックを取得する
+        const unlock = await flockByTenantID(tenant.id)
+        try {
+          const pss = await tenantDB.all<PlayerScoreRow[]>(
+            'SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC',
+            tenant.id,
+            competition.id
+          )
+
+          const scoredPlayerSet: { [player_id: string]: number } = {}
+          const tmpRanks: (CompetitionRank & WithRowNum)[] = []
+          for (const ps of pss) {
+            // player_scoreが同一player_id内ではrow_numの降順でソートされているので
+            // 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+            if (scoredPlayerSet[ps.player_id]) {
+              continue
+            }
+            scoredPlayerSet[ps.player_id] = 1
+            const p = await retrievePlayer(tenantDB, ps.player_id)
+            if (!p) {
+              throw new Error('error retrievePlayer')
+            }
+
+            tmpRanks.push({
+              rank: 0,
+              score: ps.score,
+              player_id: p.id,
+              player_display_name: p.display_name,
+              row_num: ps.row_num,
+            })
+          }
+
+          tmpRanks.sort((a, b) => {
+            if (a.score === b.score) {
+              return a.row_num < b.row_num ? -1 : 1
+            }
+            return a.score > b.score ? -1 : 1
+          })
+
+          tmpRanks.forEach((rank, index) => {
+            if (index < rankAfter) return
+            if (ranks.length >= 100) return
+            ranks.push({
+              rank: index + 1,
+              score: rank.score,
+              player_id: rank.player_id,
+              player_display_name: rank.player_display_name,
+            })
+          })
+        } finally {
+          unlock()
+        }
+      } finally {
+        tenantDB.close()
+      }
+
+      const data: CompetitionRankingResult = {
+        competition: cd,
+        ranks,
+      }
+      res.status(200).json({
+        status: true,
+        data,
+      })
+    } catch (error: any) {
+      if (error.status) {
+        throw error // rethrow
+      }
+      throw new ErrorWithStatus(500, error)
+    }
+  })
+)
 
 // 参加者向けAPI
 // GET /api/player/competitions
