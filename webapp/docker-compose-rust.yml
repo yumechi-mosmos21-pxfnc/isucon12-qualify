@@ -16,3 +16,4 @@ services:
       - /home/isucon/tmp/rust/target:/home/isucon/webapp/rust/target
       - /home/isucon/tmp/rust/registry:/usr/local/cargo/registry
     init: true
+    user: "${UID}:${GID}"
