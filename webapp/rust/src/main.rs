@@ -1230,26 +1230,6 @@ async fn competition_score_handler(
         .await?;
 
     let rows = player_score_rows.len() as i64;
-    // for ps in player_score_rows {
-    //     sqlx::query("INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-    //         .bind(ps.id)
-    //         .bind(ps.tenant_id)
-    //         .bind(ps.player_id)
-    //         .bind(ps.competition_id)
-    //         .bind(ps.score)
-    //         .bind(ps.row_num)
-    //         .bind(ps.created_at)
-    //         .bind(ps.updated_at)
-    //         .execute(&mut tenant_db)
-    //         .await?;
-    // }
-
-    // let mut s: String = "INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES ".to_string();
-    // s += &vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; rows as usize].join(",");
-    // let query_str = format!(
-    //     "INSERT INTO `unread_announcements` (`announcement_id`, `user_id`) VALUES {}",
-    //     vec!["(?, ?)"; targets_len].join(", ")
-    // );
     let query_str = format!(
         "INSERT INTO player_score (id, tenant_id, player_id, competition_id, score, row_num, created_at, updated_at) VALUES {}",
         vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; rows as usize].join(",")
