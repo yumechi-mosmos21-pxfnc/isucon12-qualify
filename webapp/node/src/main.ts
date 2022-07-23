@@ -15,7 +15,7 @@ import { app } from "./app";
 import { initializeScript, cookieName, RoleAdmin, RoleOrganizer, RolePlayer, RoleNone, tenantNameRegexp } from "./constants";
 import { getEnv } from "./get_env";
 import { adminDB } from "./admin_db";
-import { connectToTenantDB, createTenantDB } from "src/tenant_db";
+import { connectToTenantDB, createTenantDB } from "./tenant_db";
 import { dispenseID } from "./dispense_id";
 import { ErrorWithStatus } from "./error_with_status";
 import { TenantWithBilling, TenantDetail, BillingReport, PlayerDetail, CompetitionDetail, PlayerScoreDetail, CompetitionRank, WithRowNum, Viewer, TenantsAddResult, InitializeResult, PlayersListResult, PlayersAddResult, PlayerDisqualifiedResult, CompetitionsAddResult, ScoreResult, BillingResult, CompetitionRankingResult, PlayerResult, MeResult, CompetitionsResult, TenantRow, CompetitionRow, VisitHistorySummaryRow, PlayerRow, PlayerScoreRow } from "./types";
