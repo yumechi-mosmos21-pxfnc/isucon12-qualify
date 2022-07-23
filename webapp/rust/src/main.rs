@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use actix_multipart::Multipart;
 use actix_web::http::StatusCode;
-use actix_web::middleware::Logger;
 use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
 use bytes::BytesMut;
 use futures_util::stream::StreamExt as _;
@@ -225,7 +224,6 @@ pub async fn main() -> std::io::Result<()> {
             .route("competitions", web::get().to(player_competitions_handler));
 
         actix_web::App::new()
-            .wrap(Logger::default())
             .wrap_fn(|req, srv| {
                 // 全APIにCache-Control: privateを設定する
                 use actix_web::dev::Service as _;
