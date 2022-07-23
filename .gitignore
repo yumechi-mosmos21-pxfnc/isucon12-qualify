@@ -4,8 +4,8 @@
 
 
 # ホワイトリスト
-!.gitignore
-!.gitattributes
+!/.gitignore
+!/.gitattributes
 !public/**
 !webapp/**
 !initial_data/**
