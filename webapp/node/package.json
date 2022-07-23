@@ -6,7 +6,8 @@
   "scripts": {
     "serve": "ts-node --transpile-only src/main.ts",
     "lint": "eslint ./src --ext .ts",
-    "format": "prettier --write src/"
+    "format": "prettier --write src/",
+    "start": "node dist/main.js"
   },
   "author": "",
   "license": "ISC",

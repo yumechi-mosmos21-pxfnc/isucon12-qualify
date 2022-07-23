@@ -3,7 +3,7 @@ import { app } from "./app";
 import { wrap } from "./wrap";
 import { parseViewer } from "./parse_viewer";
 import { RolePlayer } from "./constants";
-import { ErrorWithStatus } from "src/error_with_status";
+import { ErrorWithStatus } from "./error_with_status";
 import { CompetitionDetail, CompetitionRank, TenantRow, PlayerScoreRow, WithRowNum, CompetitionRankingResult } from "./types";
 import { Request, Response } from "express";
 import { connectToTenantDB } from "./tenant_db";
