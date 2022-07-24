@@ -10,3 +10,5 @@
 !webapp/**
 !initial_data/**
 !initial_data_fix.py
+!initial_summery.py
+!data_insert.sql
