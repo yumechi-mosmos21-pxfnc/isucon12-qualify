@@ -56,6 +56,11 @@ services:
       - "-c"
       - "sleep infinity"
 
+  redis:
+    image: redis:7.2.3
+    ports:
+      - "16379:6379"
+
 volumes:
   mysql:
   gopkg:

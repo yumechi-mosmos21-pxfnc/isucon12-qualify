@@ -11,7 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::{MySqlConnectOptions, MySqlDatabaseError};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
-use sqlx::Connection as _;
+use sqlx::{Connection as _, MySql, Pool};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::error;
 use tracing_subscriber::prelude::*;
+use redis::Commands;
 
 const TENANT_DB_SCHEMA_FILE_PATH: &str = "../sql/tenant/10_schema.sql";
 const INITIALIZE_SCRIPT: &str = "../sql/init.sh";
@@ -160,6 +161,17 @@ async fn dispense_id(admin_db: &sqlx::MySqlPool) -> sqlx::Result<String> {
     Err(last_err.unwrap())
 }
 
+#[derive(Debug)]
+struct AppState {
+    pool:  Pool<MySql>,
+    client: redis::Client
+}
+impl AppState {
+    fn new(pool: Pool<MySql>, client: redis::Client) -> Self {
+        Self { pool, client }
+    }
+}
+
 #[actix_web::main]
 pub async fn main() -> std::io::Result<()> {
     if std::env::var_os("RUST_LOG").is_none() {
@@ -207,6 +219,11 @@ pub async fn main() -> std::io::Result<()> {
         .connect_with(mysql_config)
         .await
         .expect("failed to connect mysql db");
+
+    let client = redis::Client::open("redis://127.0.0.1:16379").expect("failed to connect redis");
+
+    let app_data = web::Data::new(AppState::new(pool, client));
+
     let server = actix_web::HttpServer::new(move || {
         // SaaS管理者向けAPI
         let admin_api = web::scope("/admin/tenants")
@@ -261,9 +278,10 @@ pub async fn main() -> std::io::Result<()> {
                     Ok(res)
                 }
             })
-            .app_data(web::Data::new(pool.clone()))
+            .app_data(app_data.clone())
             // ベンチマーカー向けAPI
             .route("/initialize", web::post().to(initialize_handler))
+            .route("/debug", web::get().to(debug_handler))
             .service(
                 web::scope("/api")
                     .service(admin_api)
@@ -583,10 +601,11 @@ struct TenantsAddHandlerForm {
 // テナントを追加する
 // POST /api/admin/tenants/add
 async fn tenants_add_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     form: web::Form<TenantsAddHandlerForm>,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = &data.pool;
     let form = form.into_inner();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.tenant_name != "admin" {
@@ -616,7 +635,7 @@ async fn tenants_add_handler(
     .bind(&form.display_name)
     .bind(now)
     .bind(now)
-    .execute(&**admin_db)
+    .execute(admin_db)
     .await;
     if let Err(e) = insert_res {
         if let Some(database_error) = e.as_database_error() {
@@ -772,11 +791,12 @@ struct TenantsBillingHandlerQuery {
 // GET /api/admin/tenants/billing
 // URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
 async fn tenants_billing_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     query: web::Query<TenantsBillingHandlerQuery>,
     conn: actix_web::dev::ConnectionInfo,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     if conn.host() != get_env("ISUCON_ADMIN_HOSTNAME", "admin.t.isucon.dev") {
         return Err(Error::Custom(
             StatusCode::NOT_FOUND,
@@ -800,7 +820,7 @@ async fn tenants_billing_handler(
     //   を合計したものを
     // テナントの課金とする
     let ts: Vec<TenantRow> = sqlx::query_as("SELECT * FROM tenant ORDER BY id DESC")
-        .fetch_all(&**admin_db)
+        .fetch_all(&admin_db)
         .await?;
 
     let mut tenant_billings = Vec::with_capacity(ts.len());
@@ -854,9 +874,10 @@ struct PlayersListHandlerResult {
 // GET /api/organizer/players
 // 参加者一覧を返す
 async fn players_list_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: actix_web::HttpRequest,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -896,10 +917,11 @@ struct PlayersAddHandlerResult {
 // GET /api/organizer/players/add
 // テナントに参加者を追加する
 async fn players_add_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     form_param: web::Form<Vec<(String, String)>>,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -960,10 +982,11 @@ struct PlayerDisqualifiedHandlerResult {
 // POST /api/organizer/player/:player_id/disqualified
 // 参加者を失格にする
 async fn player_disqualified_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     params: web::Path<(String,)>,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -1030,10 +1053,11 @@ struct CompetitionAddHandlerForm {
 // POST /api/organizer/competitions/add
 // 大会を追加する
 async fn competitions_add_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     form: web::Form<CompetitionAddHandlerForm>,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -1079,10 +1103,11 @@ async fn competitions_add_handler(
 // POST /api/organizer/competition/:competition_id/finish
 // 大会を終了する
 async fn competition_finish_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     params: web::Path<(String,)>,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v: Viewer = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -1134,11 +1159,12 @@ struct CompetitionScoreHandlerForm {
 // POST /api/organizer/competition/:competition_id/score
 // 大会のスコアをCSVでアップロードする
 async fn competition_score_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     params: web::Path<(String,)>,
     mut payload: Multipart,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -1279,9 +1305,10 @@ struct BillingHandlerResult {
 // GET /api/organizer/billing
 // テナント内の課金レポートを取得する
 async fn billing_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -1327,10 +1354,11 @@ struct PlayerHandlerResult {
 // GET /api/player/player/:player_id
 // 参加者の詳細情報を取得する
 async fn player_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     params: web::Path<(String,)>,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_PLAYER {
         return Err(Error::Custom(
@@ -1428,11 +1456,12 @@ struct CompetitionRankingHandlerQuery {
 // GET /api/player/competition/:competition_id/ranking
 // 大会ごとのランキングを取得する
 async fn competition_ranking_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
     params: web::Path<(String,)>,
     query: web::Query<CompetitionRankingHandlerQuery>,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_PLAYER {
         return Err(Error::Custom(
@@ -1464,7 +1493,7 @@ async fn competition_ranking_handler(
         .as_secs() as i64;
     let tenant: TenantRow = sqlx::query_as("SELECT * FROM tenant WHERE id = ?")
         .bind(v.tenant_id)
-        .fetch_one(&**admin_db)
+        .fetch_one(&admin_db)
         .await?;
 
     sqlx::query("INSERT INTO visit_history (player_id, tenant_id, competition_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
@@ -1473,7 +1502,7 @@ async fn competition_ranking_handler(
         .bind(&competition_id)
         .bind(now)
         .bind(now)
-        .execute(&**admin_db)
+        .execute(&admin_db)
         .await?;
 
     let rank_after = query.rank_after.unwrap_or(0);
@@ -1550,9 +1579,10 @@ struct CompetitionsHandlerResult {
 // GET /api/player/competitions
 // 大会の一覧を取得する
 async fn player_competitions_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_PLAYER {
         return Err(Error::Custom(
@@ -1570,9 +1600,10 @@ async fn player_competitions_handler(
 // GET /api/organizer/competitions
 // 大会の一覧を取得する
 async fn organizer_competitions_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let v = parse_viewer(&admin_db, &request).await?;
     if v.role != ROLE_ORGANIZER {
         return Err(Error::Custom(
@@ -1627,9 +1658,10 @@ struct MeHandlerResult {
 // GET /api/me
 // JWTで認証した結果、テナントやユーザ情報を返す
 async fn me_handler(
-    admin_db: web::Data<sqlx::MySqlPool>,
+    data: web::Data<AppState>,
     request: HttpRequest,
 ) -> actix_web::Result<HttpResponse, Error> {
+    let admin_db = data.pool.clone();
     let tenant = match retrieve_tenant_row_from_header(&admin_db, &request).await? {
         Some(t) => t,
         None => {
@@ -1732,4 +1764,15 @@ async fn initialize_handler() -> Result<HttpResponse, Error> {
             .into(),
         ))
     }
+}
+
+async fn debug_handler(
+    data: web::Data<AppState>
+) -> Result<HttpResponse, Error> {
+    let conn = &mut data.client.get_connection().expect("error get_connection");
+    let _: () = conn.set("my_key", 42).expect("error set");
+    let value: i32 = conn.get("my_key").expect("error get");
+    println!("redis get: {:?}", value);
+
+    Ok(HttpResponse::NoContent().finish())
 }
