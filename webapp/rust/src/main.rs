@@ -198,7 +198,7 @@ pub async fn main() -> std::io::Result<()> {
         .password(&get_env("ISUCON_DB_PASSWORD", "isucon"))
         .database(&get_env("ISUCON_DB_NAME", "isuports"))
         .port(
-            get_env("ISUCON_DB_PORT", "3306")
+            get_env("ISUCON_DB_PORT", "13306")
                 .parse()
                 .expect("failed to parse port number"),
         );
