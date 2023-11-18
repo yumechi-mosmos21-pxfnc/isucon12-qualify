@@ -19,7 +19,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::error;
 use tracing_subscriber::prelude::*;
-use redis::Commands;
+use opentelemetry::{global, trace::{Tracer, TracerProvider as _}, KeyValue, Context as _Context};
+use opentelemetry::trace::TraceContextExt;
+use opentelemetry_sdk::{trace, Resource, runtime::TokioCurrentThread};
+use opentelemetry_otlp::WithExportConfig;
 
 const TENANT_DB_SCHEMA_FILE_PATH: &str = "../sql/tenant/10_schema.sql";
 const INITIALIZE_SCRIPT: &str = "../sql/init.sh";
@@ -1767,12 +1770,40 @@ async fn initialize_handler() -> Result<HttpResponse, Error> {
 }
 
 async fn debug_handler(
-    data: web::Data<AppState>
 ) -> Result<HttpResponse, Error> {
-    let conn = &mut data.client.get_connection().expect("error get_connection");
-    let _: () = conn.set("my_key", 42).expect("error set");
-    let value: i32 = conn.get("my_key").expect("error get");
-    println!("redis get: {:?}", value);
+    let new_relic_app_name = get_env("NEW_RELIC_APP_NAME", "LOCAL_EXAMPLE");
+    let new_relic_license_key = get_env("NEW_RELIC_API_KEY", "LOCAL_EXAMPLE_KEY");
+    println!("{:?}, {:?}", new_relic_app_name, new_relic_license_key);
+    let otel_exporter_otlp_traces_endpoint = "https://otlp.nr-data.net";
+    let exporter = opentelemetry_otlp::new_exporter()
+        .http()
+        .with_endpoint(otel_exporter_otlp_traces_endpoint)
+        .with_headers(HashMap::from([(
+            "api-key".into(),
+            new_relic_license_key.to_string(),
+        )]));
+
+    let tracer = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(exporter)
+        .with_trace_config(
+            trace::config().with_resource(Resource::new(vec![KeyValue::new(
+                opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                new_relic_app_name.to_string(),
+            )])),
+        )
+        .install_batch(TokioCurrentThread);
+
+    println!("tracer: {:?}", tracer);
+    tracer.expect("failed to create tracer").in_span("doing_work", |cx| {
+        let span = cx.span();
+        span.add_event(
+            "tracer".to_string(),
+            vec![KeyValue::new("Starting tracer", true)],
+        );
+    });
+
+    global::shutdown_tracer_provider();
 
     Ok(HttpResponse::NoContent().finish())
 }
